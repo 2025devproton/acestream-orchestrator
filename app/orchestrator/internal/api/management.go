@@ -204,34 +204,34 @@ func (s *ProxyServer) mgHandleListEngines(w http.ResponseWriter, r *http.Request
 			streams = []string{}
 		}
 		out = append(out, engineOut{
-			ContainerID:        e.ContainerID,
-			ContainerName:      e.ContainerName,
-			Host:               e.Host,
-			Port:               e.Port,
-			APIPort:            e.APIPort,
-			Labels:             labels,
-			Forwarded:          e.Forwarded,
-			VPNContainer:       e.VPNContainer,
-			HealthStatus:       string(e.HealthStatus),
-			P2PPort:            e.P2PPort,
-			FirstSeen:          e.FirstSeen,
-			LastSeen:           e.LastSeen,
-			Draining:           e.Draining,
-			DrainReason:        e.DrainReason,
+			ContainerID:     e.ContainerID,
+			ContainerName:   e.ContainerName,
+			Host:            e.Host,
+			Port:            e.Port,
+			APIPort:         e.APIPort,
+			Labels:          labels,
+			Forwarded:       e.Forwarded,
+			VPNContainer:    e.VPNContainer,
+			HealthStatus:    string(e.HealthStatus),
+			P2PPort:         e.P2PPort,
+			FirstSeen:       e.FirstSeen,
+			LastSeen:        e.LastSeen,
+			Draining:        e.Draining,
+			DrainReason:     e.DrainReason,
 			StreamCount:     streamCounts[e.ContainerID],
 			TotalPeers:      e.TotalPeers,
 			TotalSpeedDown:  e.TotalSpeedDown,
 			TotalSpeedUp:    e.TotalSpeedUp,
 			LastHealthCheck: e.LastHealthCheck,
-			LastStreamUsage:    e.LastStreamUsage,
-			EngineVariant:      e.EngineVariant,
-			Platform:           e.Platform,
-			Version:            e.Version,
-			ForwardedPort:      e.ForwardedPort,
-			CPUPercent:         e.CPUPercent,
-			MemoryUsage:        e.MemoryUsage,
-			MemoryPercent:      e.MemoryPercent,
-			Streams:            streams,
+			LastStreamUsage: e.LastStreamUsage,
+			EngineVariant:   e.EngineVariant,
+			Platform:        e.Platform,
+			Version:         e.Version,
+			ForwardedPort:   e.ForwardedPort,
+			CPUPercent:      e.CPUPercent,
+			MemoryUsage:     e.MemoryUsage,
+			MemoryPercent:   e.MemoryPercent,
+			Streams:         streams,
 		})
 	}
 	mgWriteJSON(w, http.StatusOK, out)
@@ -1568,6 +1568,16 @@ func (s *ProxyServer) mgHandleModifyM3U(w http.ResponseWriter, r *http.Request) 
 		} else if strings.HasPrefix(line, "ace://") {
 			contentID := strings.TrimPrefix(line, "ace://")
 			line = baseURL + "/ace/getstream?id=" + contentID
+		} else if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
+			if parsedLine, err := url.Parse(line); err == nil {
+				hostname := parsedLine.Hostname()
+				if (hostname == "127.0.0.1" || hostname == "localhost") && parsedLine.Path == "/ace/getstream" {
+					line = baseURL + parsedLine.EscapedPath()
+					if parsedLine.RawQuery != "" {
+						line += "?" + parsedLine.RawQuery
+					}
+				}
+			}
 		}
 		buf.WriteString(line + "\n")
 	}
