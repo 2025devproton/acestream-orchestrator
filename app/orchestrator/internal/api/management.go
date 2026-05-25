@@ -1572,9 +1572,15 @@ func (s *ProxyServer) mgHandleModifyM3U(w http.ResponseWriter, r *http.Request) 
 			if parsedLine, err := url.Parse(line); err == nil {
 				hostname := parsedLine.Hostname()
 				if (hostname == "127.0.0.1" || hostname == "localhost") && parsedLine.Path == "/ace/getstream" {
-					line = baseURL + parsedLine.EscapedPath()
-					if parsedLine.RawQuery != "" {
-						line += "?" + parsedLine.RawQuery
+					schemeIdx := strings.Index(line, "://")
+					if schemeIdx != -1 {
+						afterScheme := line[schemeIdx+3:]
+						slashIdx := strings.Index(afterScheme, "/")
+						if slashIdx != -1 {
+							line = baseURL + afterScheme[slashIdx:]
+						} else {
+							line = baseURL
+						}
 					}
 				}
 			}
