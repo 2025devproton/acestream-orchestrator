@@ -7,13 +7,36 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
-const officialGluetunServersURL = "https://raw.githubusercontent.com/qdm12/gluetun/master/internal/storage/servers.json"
+// Gluetun moved its server data out of the main repo (the old monolithic
+// internal/storage/servers.json) into the dedicated qdm12/gluetun-servers repo,
+// which stores one JSON file per provider under pkg/servers. We list those files
+// via the GitHub contents API and fetch each raw file, then reassemble them into
+// the monolithic {"version":N, "<provider>": {"servers":[...]}, ...} structure the
+// rest of the pipeline (and the gluetun sidecar's /gluetun/servers.json) expects.
+// vars (not consts) so tests can point them at a local httptest server.
+var (
+	gluetunServersContentsURL = "https://api.github.com/repos/qdm12/gluetun-servers/contents/pkg/servers?ref=main"
+	gluetunServersRawBase     = "https://raw.githubusercontent.com/qdm12/gluetun-servers/main/pkg/servers/"
+)
+
+// fallbackProviderStems is used only when the GitHub contents API listing fails
+// (e.g. rate-limited). Filename stems match the gluetun provider names, spaces
+// included. Kept in sync manually with the gluetun-servers repo.
+var fallbackProviderStems = []string{
+	"airvpn", "cyberghost", "expressvpn", "fastestvpn", "giganews",
+	"hidemyass", "ipvanish", "ivpn", "mullvad", "nordvpn", "ovpn",
+	"perfect privacy", "privado", "private internet access", "privatevpn",
+	"protonvpn", "purevpn", "slickvpn", "surfshark", "torguard",
+	"vpn unlimited", "vpnsecure", "vyprvpn", "windscribe",
+}
 
 // ServersRefreshService periodically downloads the Gluetun official servers list
 // and writes it to the configured servers directory.
@@ -118,7 +141,7 @@ func (s *ServersRefreshService) RefreshOfficial(ctx context.Context) error {
 
 	slog.Info("Refreshing VPN servers from official Gluetun source")
 
-	payload, err := s.download(ctx, officialGluetunServersURL)
+	payload, err := s.fetchAllProviders(ctx)
 	if err != nil {
 		s.recordResult(err)
 		return err
@@ -214,7 +237,7 @@ func (s *ServersRefreshService) Status() map[string]interface{} {
 	defer s.mu.Unlock()
 	m := map[string]interface{}{
 		"in_progress":  s.inProgress,
-		"official_url": officialGluetunServersURL,
+		"official_url": gluetunServersContentsURL,
 	}
 	if !s.lastAt.IsZero() {
 		m["last_at"] = s.lastAt
@@ -248,6 +271,153 @@ func (s *ServersRefreshService) resolveDir() string {
 		return v
 	}
 	return "."
+}
+
+// providerSource is a single provider's JSON file to fetch from the
+// gluetun-servers repo. stem is the gluetun provider name (filename without the
+// .json suffix, spaces preserved, e.g. "private internet access").
+type providerSource struct {
+	stem string
+	url  string
+}
+
+// fetchAllProviders discovers every provider file in the gluetun-servers repo,
+// downloads them concurrently, and assembles them into the monolithic
+// servers.json structure keyed by provider name. Individual provider failures
+// are logged and skipped; only a total failure (zero providers fetched) errors.
+func (s *ServersRefreshService) fetchAllProviders(ctx context.Context) (map[string]interface{}, error) {
+	sources := s.discoverProviderSources(ctx)
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("no Gluetun provider sources to fetch")
+	}
+
+	type result struct {
+		stem string
+		obj  map[string]interface{}
+		err  error
+	}
+
+	const workers = 6
+	jobs := make(chan providerSource)
+	results := make(chan result)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for src := range jobs {
+				obj, err := s.download(ctx, src.url)
+				results <- result{stem: src.stem, obj: obj, err: err}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, src := range sources {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- src:
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Reassemble into the monolithic shape the pipeline expects: each provider's
+	// file object ({"version":N,"timestamp":..,"servers":[..]}) becomes a section
+	// keyed by provider name, preserving its own version/timestamp.
+	payload := map[string]interface{}{"version": 1}
+	fetched := 0
+	for r := range results {
+		if r.err != nil {
+			slog.Warn("Failed to fetch Gluetun provider servers", "provider", r.stem, "err", r.err)
+			continue
+		}
+		payload[r.stem] = r.obj
+		fetched++
+	}
+
+	if fetched == 0 {
+		return nil, fmt.Errorf("failed to fetch any Gluetun provider servers")
+	}
+	slog.Info("Fetched Gluetun provider servers", "providers", fetched, "attempted", len(sources))
+	return payload, nil
+}
+
+// discoverProviderSources lists provider JSON files via the GitHub contents API,
+// falling back to a hardcoded list of raw URLs if the API is unavailable.
+func (s *ServersRefreshService) discoverProviderSources(ctx context.Context) []providerSource {
+	sources, err := s.listViaContentsAPI(ctx)
+	if err != nil {
+		slog.Warn("Gluetun servers contents API listing failed; using hardcoded provider list", "err", err)
+		return fallbackProviderSources()
+	}
+	if len(sources) == 0 {
+		slog.Warn("Gluetun servers contents API returned no providers; using hardcoded provider list")
+		return fallbackProviderSources()
+	}
+	return sources
+}
+
+func fallbackProviderSources() []providerSource {
+	out := make([]providerSource, 0, len(fallbackProviderStems))
+	for _, stem := range fallbackProviderStems {
+		out = append(out, providerSource{
+			stem: stem,
+			url:  gluetunServersRawBase + url.PathEscape(stem) + ".json",
+		})
+	}
+	return out
+}
+
+func (s *ServersRefreshService) listViaContentsAPI(ctx context.Context) ([]providerSource, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, gluetunServersContentsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "acestream-orchestrator/1.0")
+	req.Header.Set("Accept", "application/vnd.github+json")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d from contents API", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var entries []struct {
+		Name        string `json:"name"`
+		DownloadURL string `json:"download_url"`
+	}
+	if err := json.Unmarshal(body, &entries); err != nil {
+		return nil, fmt.Errorf("parsing contents API response: %w", err)
+	}
+
+	var out []providerSource
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name, ".json") {
+			continue
+		}
+		stem := strings.TrimSuffix(e.Name, ".json")
+		u := e.DownloadURL
+		if u == "" {
+			u = gluetunServersRawBase + url.PathEscape(stem) + ".json"
+		}
+		out = append(out, providerSource{stem: stem, url: u})
+	}
+	return out, nil
 }
 
 func (s *ServersRefreshService) download(ctx context.Context, url string) (map[string]interface{}, error) {
