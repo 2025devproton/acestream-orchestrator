@@ -1,0 +1,24 @@
+name: Recovery regression tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: app/orchestrator/go.mod
+          cache-dependency-path: app/orchestrator/go.sum
+      - name: Go tests with race detector
+        working-directory: app/orchestrator
+        run: go test -race ./...
+      - name: Probe and supervisor tests
+        run: python3 -m unittest discover -s tests -v
