@@ -1517,6 +1517,31 @@ func (s *ProxyServer) mgHandleCacheClear(w http.ResponseWriter, r *http.Request)
 
 // ─── M3U ─────────────────────────────────────────────────────────────────────
 
+const defaultM3UFetchTimeout = 30 * time.Second
+
+func m3uFetchClient() (*http.Client, error) {
+	timeout := defaultM3UFetchTimeout
+	if raw := strings.TrimSpace(os.Getenv("M3U_FETCH_TIMEOUT_S")); raw != "" {
+		seconds, err := strconv.Atoi(raw)
+		if err != nil || seconds < 1 || seconds > 300 {
+			return nil, fmt.Errorf("M3U_FETCH_TIMEOUT_S must be between 1 and 300 seconds")
+		}
+		timeout = time.Duration(seconds) * time.Second
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	proxyURL := strings.TrimSpace(os.Getenv("M3U_FETCH_PROXY_URL"))
+	if proxyURL != "" {
+		parsed, err := url.Parse(proxyURL)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return nil, fmt.Errorf("M3U_FETCH_PROXY_URL must be an http(s) URL")
+		}
+		transport.Proxy = http.ProxyURL(parsed)
+	}
+
+	return &http.Client{Transport: transport, Timeout: timeout}, nil
+}
+
 func (s *ProxyServer) mgHandleModifyM3U(w http.ResponseWriter, r *http.Request) {
 	// Accept both ?m3u_url= (Python compat) and ?url= (legacy)
 	m3uURL := r.URL.Query().Get("m3u_url")
@@ -1554,17 +1579,27 @@ func (s *ProxyServer) mgHandleModifyM3U(w http.ResponseWriter, r *http.Request) 
 	}
 	baseURL := scheme + "://" + host
 
+	client, err := m3uFetchClient()
+	if err != nil {
+		mgWriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	defer client.CloseIdleConnections()
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, m3uURL, nil)
 	if err != nil {
 		mgWriteJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid url"})
 		return
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		mgWriteJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to fetch m3u: " + err.Error()})
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		mgWriteJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("m3u source returned HTTP %d", resp.StatusCode)})
+		return
+	}
 
 	var buf strings.Builder
 	var line string
@@ -1595,6 +1630,10 @@ func (s *ProxyServer) mgHandleModifyM3U(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 		buf.WriteString(line + "\n")
+	}
+	if err := scanner.Err(); err != nil {
+		mgWriteJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to read m3u"})
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/x-mpegurl")
@@ -2752,17 +2791,20 @@ type lineScanner struct {
 	buf  []byte
 	line string
 	done bool
+	err  error
 }
 
 func (ls *lineScanner) Scan() bool {
-	if ls.done {
-		return false
-	}
 	for {
 		if i := strings.IndexByte(string(ls.buf), '\n'); i >= 0 {
 			ls.line = strings.TrimRight(string(ls.buf[:i]), "\r")
 			ls.buf = ls.buf[i+1:]
 			return true
+		}
+		if ls.done {
+			ls.line = strings.TrimRight(string(ls.buf), "\r")
+			ls.buf = nil
+			return ls.line != ""
 		}
 		tmp := make([]byte, 4096)
 		n, err := ls.r.Read(tmp)
@@ -2771,14 +2813,13 @@ func (ls *lineScanner) Scan() bool {
 		}
 		if err != nil {
 			ls.done = true
-			if len(ls.buf) > 0 {
-				ls.line = strings.TrimRight(string(ls.buf), "\r\n")
-				ls.buf = nil
-				return ls.line != ""
+			if err != io.EOF {
+				ls.err = err
 			}
-			return false
 		}
 	}
 }
 
 func (ls *lineScanner) Text() string { return ls.line }
+
+func (ls *lineScanner) Err() error { return ls.err }
