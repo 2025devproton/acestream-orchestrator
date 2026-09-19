@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/acestream/acestream/internal/config"
+	"github.com/acestream/acestream/internal/metrics"
 	"github.com/acestream/acestream/internal/proxy/aceapi"
 	"github.com/acestream/acestream/internal/proxy/buffer"
 	"github.com/acestream/acestream/internal/proxy/upstream"
@@ -286,7 +287,7 @@ func (m *Manager) requestViaAPI(ctx context.Context) error {
 	}
 
 	cli := aceapi.New(ep.Host, apiPort)
-	if err := cli.Connect(); err != nil {
+	if err := cli.ConnectContext(ctx); err != nil {
 		return fmt.Errorf("ace_api connect: %w", err)
 	}
 
@@ -317,6 +318,9 @@ func (m *Manager) requestViaAPI(ctx context.Context) error {
 }
 
 func (m *Manager) startReadLoop(ctx context.Context, startedAt time.Time) (string, string, *int) {
+	attempts := 0
+	var nextAllowed, recoveringSince time.Time
+	defer func() { m.mu.Lock(); m.connected = false; m.mu.Unlock() }()
 	for {
 		m.mu.Lock()
 		purl := m.playbackURL
@@ -329,6 +333,7 @@ func (m *Manager) startReadLoop(ctx context.Context, startedAt time.Time) (strin
 		}
 
 		m.buf.Reset()
+		sessionStarted := time.Now()
 		r := upstream.New(m.params.ContentID, purl, m.buf, m.params.StreamMode)
 		readerCtx, readerCancel := context.WithCancel(ctx)
 
@@ -351,59 +356,108 @@ func (m *Manager) startReadLoop(ctx context.Context, startedAt time.Time) (strin
 			}
 		}
 
-		select {
-		case newEngine := <-m.swapCh:
-			stopKeepalive()
-			readerCancel()
-			r.Stop()
-			<-readerDone
-			slog.Info("hot-swapping engine", "stream", m.params.ContentID, "new_engine", fmt.Sprintf("%s:%d", newEngine.Host, newEngine.Port))
+		interval := config.C.Load().StreamStallCheckInterval
+		if interval <= 0 {
+			interval = 5 * time.Second
+		}
+		ticker := time.NewTicker(interval)
+		stopReader := func() {
 			m.mu.Lock()
-			m.params.Engine = newEngine
+			m.connected = false
 			m.mu.Unlock()
-			m.touchRedisTimestamp(rediskeys.StreamInitTime(m.params.ContentID), time.Hour)
-			m.touchRedisTimestamp(rediskeys.LastClientDisconnect(m.params.ContentID), 60*time.Second)
-			if err := m.requestStream(ctx); err != nil {
-				slog.Error("engine request failed after swap", "stream", m.params.ContentID, "err", err)
-				outcome, reason := classifyProbeOutcome(err)
-				return outcome, reason, nil
-			}
-
-		case err := <-readerDone:
-			stopKeepalive()
-			readerCancel()
-			// Compute TTFB from reader's recorded first-byte timestamp if available.
-			var ttfbMs *int
-			if fb := r.FirstByteTime(); !fb.IsZero() {
-				v := int(fb.Sub(startedAt).Milliseconds())
-				if v < 0 {
-					v = 0
-				}
-				ttfbMs = &v
-			}
-			if err != nil && ctx.Err() == nil {
-				slog.Warn("upstream reader exited", "stream", m.params.ContentID, "err", err)
-				outcome, reason := classifyProbeOutcome(err)
-				return outcome, reason, ttfbMs
-			}
-			slog.Info("upstream reader finished", "stream", m.params.ContentID)
-			return "success", "reader finished", ttfbMs
-
-		case <-ctx.Done():
+			ticker.Stop()
 			stopKeepalive()
 			readerCancel()
 			r.Stop()
 			<-readerDone
-			// Compute TTFB from reader if available.
-			var ttfbMs *int
-			if fb := r.FirstByteTime(); !fb.IsZero() {
-				v := int(fb.Sub(startedAt).Milliseconds())
-				if v < 0 {
-					v = 0
+		}
+	readSession:
+		for {
+			select {
+			case <-ticker.C:
+				cfg := config.C.Load()
+				now := time.Now()
+				lastChunk := m.buf.LastChunkWriteTime()
+				if !recoveringSince.IsZero() && !lastChunk.IsZero() {
+					metrics.StreamRecoveryTotal.WithLabelValues("resumed").Inc()
+					metrics.StreamRecoveryDuration.Observe(now.Sub(recoveringSince).Seconds())
+					slog.Info("stream buffer progress resumed", "stream", m.params.ContentID, "attempt", attempts)
+					recoveringSince = time.Time{}
 				}
-				ttfbMs = &v
+				if !stallDue(now, sessionStarted, lastChunk, nextAllowed, m.clients.LocalCount(), cfg) {
+					continue
+				}
+				stopReader()
+				if ctx.Err() != nil {
+					return "success", "context cancelled", nil
+				}
+				if attempts >= cfg.StreamStallMaxRecoveries {
+					metrics.StreamRecoveryTotal.WithLabelValues("exhausted").Inc()
+					return "timeout", "stream stall recovery budget exhausted", nil
+				}
+				attempts++
+				recoveringSince = now
+				metrics.StreamRecoveryTotal.WithLabelValues("attempted").Inc()
+				slog.Warn("restarting stalled engine session", "stream", m.params.ContentID, "attempt", attempts)
+				m.sendEngineStop()
+				if err := m.requestStream(ctx); err != nil {
+					metrics.StreamRecoveryTotal.WithLabelValues("failed").Inc()
+					outcome, reason := classifyProbeOutcome(err)
+					return outcome, reason, nil
+				}
+				nextAllowed = time.Now().Add(cfg.StreamStallCooldown)
+				break readSession
+			case newEngine := <-m.swapCh:
+				stopReader()
+				m.sendEngineStop()
+				recoveringSince = time.Time{}
+				slog.Info("hot-swapping engine", "stream", m.params.ContentID, "new_engine", fmt.Sprintf("%s:%d", newEngine.Host, newEngine.Port))
+				m.mu.Lock()
+				m.params.Engine = newEngine
+				m.mu.Unlock()
+				m.touchRedisTimestamp(rediskeys.StreamInitTime(m.params.ContentID), time.Hour)
+				m.touchRedisTimestamp(rediskeys.LastClientDisconnect(m.params.ContentID), 60*time.Second)
+				if err := m.requestStream(ctx); err != nil {
+					slog.Error("engine request failed after swap", "stream", m.params.ContentID, "err", err)
+					outcome, reason := classifyProbeOutcome(err)
+					return outcome, reason, nil
+				}
+				break readSession
+
+			case err := <-readerDone:
+				ticker.Stop()
+				stopKeepalive()
+				readerCancel()
+				// Compute TTFB from reader's recorded first-byte timestamp if available.
+				var ttfbMs *int
+				if fb := r.FirstByteTime(); !fb.IsZero() {
+					v := int(fb.Sub(startedAt).Milliseconds())
+					if v < 0 {
+						v = 0
+					}
+					ttfbMs = &v
+				}
+				if err != nil && ctx.Err() == nil {
+					slog.Warn("upstream reader exited", "stream", m.params.ContentID, "err", err)
+					outcome, reason := classifyProbeOutcome(err)
+					return outcome, reason, ttfbMs
+				}
+				slog.Info("upstream reader finished", "stream", m.params.ContentID)
+				return "success", "reader finished", ttfbMs
+
+			case <-ctx.Done():
+				stopReader()
+				// Compute TTFB from reader if available.
+				var ttfbMs *int
+				if fb := r.FirstByteTime(); !fb.IsZero() {
+					v := int(fb.Sub(startedAt).Milliseconds())
+					if v < 0 {
+						v = 0
+					}
+					ttfbMs = &v
+				}
+				return "success", "context cancelled", ttfbMs
 			}
-			return "success", "context cancelled", ttfbMs
 		}
 		readerCancel()
 	}

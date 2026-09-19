@@ -13,6 +13,7 @@ import (
 
 	"github.com/acestream/acestream/internal/config"
 	"github.com/acestream/acestream/internal/controlplane/engine"
+	"github.com/acestream/acestream/internal/controlplane/identity"
 	"github.com/acestream/acestream/internal/state"
 )
 
@@ -135,9 +136,8 @@ func Reindex(ctx context.Context) bool {
 			break
 		}
 
-		isManagedEngine := attrs[cfg.ContainerLabelKey] == cfg.ContainerLabelVal
-		isManagedVPN := attrs["acestream-orchestrator.managed"] == "true" && attrs["role"] == "vpn_node"
-		isDynamicVPN := strings.HasPrefix(strings.ToLower(containerName), "gluetun-dyn-")
+		isManagedVPN := isManagedVPNContainer(containerName, attrs)
+		isManagedEngine := isManagedEngineContainer(containerName, attrs, cfg)
 
 		if isManagedEngine {
 			runningEngines[c.ID] = true
@@ -214,7 +214,7 @@ func Reindex(ctx context.Context) bool {
 			}
 		}
 
-		if isManagedVPN || isDynamicVPN {
+		if isManagedVPN {
 			runningVPNs[containerName] = true
 
 			// Resolve internal IP for cross-network Gluetun API access.
@@ -236,7 +236,7 @@ func Reindex(ctx context.Context) bool {
 					Status:                  "running",
 					Healthy:                 false,
 					Provider:                provider,
-					ManagedDynamic:          isDynamicVPN,
+					ManagedDynamic:          identity.OwnedVPN(containerName, attrs),
 					PortForwardingSupported: attrs["port_forwarding_supported"] == "true",
 					Lifecycle:               "active",
 					ControlHost:             controlHost,
@@ -284,12 +284,23 @@ func Reindex(ctx context.Context) bool {
 	}
 
 	// Remove stale VPN nodes.
+	return reconcileVPNPresence(st, runningVPNs, time.Now()) || changed
+}
+
+func reconcileVPNPresence(st *state.Store, runningVPNs map[string]bool, now time.Time) bool {
+	changed := false
 	const vpnStartupGrace = 30 * time.Second
 	for _, n := range st.ListVPNNodes() {
 		if !runningVPNs[n.ContainerName] {
 			// Skip nodes registered very recently — they may be mid-provisioning
 			// and not yet appear in the ContainerList snapshot.
-			if time.Since(n.FirstSeen) < vpnStartupGrace {
+			if now.Sub(n.FirstSeen) < vpnStartupGrace {
+				continue
+			}
+			if n.ManagedDynamic {
+				// Lifecycle reconciliation owns cleanup and credential release.
+				st.SetVPNNodeHealthy(n.ContainerName, false)
+				st.SetVPNNodeStatus(n.ContainerName, "down")
 				continue
 			}
 			if st.RemoveVPNNode(n.ContainerName) {

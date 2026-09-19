@@ -149,19 +149,15 @@ func main() {
 	go probeCollector.Run(appCtx)
 
 	prov = vpnpkg.NewProvisioner(creds, repEngine)
+	prov.SetPublisher(pub)
+	prov.SetEngineRemovedHook(func(e *state.Engine) { cpengine.Alloc.ReleaseFromLabels(e.Labels) })
 	repEngine.Start(appCtx)
 	svcRefresh = vpnpkg.NewServersRefreshService(serversDir, repEngine)
 	go svcRefresh.Run(appCtx, cfg.VPNServersAutoRefresh, cfg.VPNServersRefreshPeriod)
 
 	vpnManager := vpnpkg.NewLifecycleManager(pub, prov)
 	vpnManager.SetNudger(ctrl.Nudge)
-	vpnManager.SetEngineStopper(cpengine.StopEnginesByVPN)
 	ctrl.SetVPNNudger(vpnManager.Nudge)
-	go vpnManager.Run(appCtx)
-
-	// Trigger initial resource check immediately to start VPN provisioning
-	// in parallel with Docker reindexing and cleanup.
-	ctrl.EnsureMinimum()
 
 	// ── Controlplane: Docker monitor + event watcher ───────────────────────────
 	dockerMon := cpdocker.NewMonitor(pub, ctrl)
@@ -190,7 +186,11 @@ func main() {
 
 	// Restore VPN leases from discovered Docker state.
 	if creds != nil && prov != nil {
-		nodes, _ := prov.ListManagedNodes(appCtx, false)
+		nodes, err := prov.ListManagedNodes(appCtx, true)
+		if err != nil {
+			slog.Error("Cannot restore VPN leases from Docker", "err", err)
+			os.Exit(1)
+		}
 		creds.RestoreLeases(nodes)
 	}
 
@@ -202,6 +202,9 @@ func main() {
 	cleanupCancel()
 
 	ctrl.Start(appCtx)
+	// Restore leases and finish startup cleanup before any VPN provisioning.
+	go vpnManager.Run(appCtx)
+	ctrl.EnsureMinimum()
 
 	go dockerMon.Run(appCtx)
 	go eventWatcher.Run(appCtx)
@@ -449,7 +452,6 @@ func normalizeVPNServerSource(provider string) string {
 		return "gluetun"
 	}
 }
-
 
 func setupLogger() {
 	level := slog.LevelInfo

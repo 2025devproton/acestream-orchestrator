@@ -9,16 +9,20 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	dockerimage "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	dockerclient "github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 
 	"github.com/acestream/acestream/internal/config"
+	"github.com/acestream/acestream/internal/controlplane/identity"
 	"github.com/acestream/acestream/internal/state"
 )
 
@@ -44,13 +48,39 @@ type ProvisionResult struct {
 
 // Provisioner creates and destroys Gluetun VPN containers.
 type Provisioner struct {
-	creds *CredentialManager
-	rep   *ReputationEngine
+	creds           *CredentialManager
+	rep             *ReputationEngine
+	pub             *state.RedisPublisher
+	onEngineRemoved func(*state.Engine)
+	dockerFactory   func() (dockerClient, error)
+	cleanupMu       sync.Mutex // API deletion and lifecycle recovery must not release the same lease concurrently.
+}
+
+type dockerClient interface {
+	ContainerList(context.Context, container.ListOptions) ([]dockertypes.Container, error)
+	ContainerRemove(context.Context, string, container.RemoveOptions) error
+	Close() error
+}
+
+func (p *Provisioner) newDockerClient() (dockerClient, error) {
+	if p.dockerFactory != nil {
+		return p.dockerFactory()
+	}
+	return dockerclient.NewClientWithOpts(
+		dockerclient.FromEnv,
+		dockerclient.WithAPIVersionNegotiation(),
+	)
 }
 
 func NewProvisioner(creds *CredentialManager, rep *ReputationEngine) *Provisioner {
 	return &Provisioner{creds: creds, rep: rep}
 }
+
+// SetPublisher must be called before starting provisioner users.
+func (p *Provisioner) SetPublisher(pub *state.RedisPublisher) { p.pub = pub }
+
+// SetEngineRemovedHook installs allocator cleanup; configure before use.
+func (p *Provisioner) SetEngineRemovedHook(f func(*state.Engine)) { p.onEngineRemoved = f }
 
 // ProvisionNode leases a credential, builds the Gluetun env, and starts a
 // new VPN container. On any failure after leasing, the lease is released.
@@ -194,41 +224,105 @@ func (p *Provisioner) ProvisionNode(ctx context.Context) (*ProvisionResult, erro
 // DestroyNode stops the VPN container, releases the credential lease, and
 // removes the node from global state.
 func (p *Provisioner) DestroyNode(ctx context.Context, containerName string) error {
-	cli, err := dockerclient.NewClientWithOpts(
-		dockerclient.FromEnv,
-		dockerclient.WithAPIVersionNegotiation(),
-	)
+	p.cleanupMu.Lock()
+	defer p.cleanupMu.Unlock()
+	if containerName == "" || strings.TrimPrefix(containerName, "/") != containerName {
+		return fmt.Errorf("invalid VPN container name")
+	}
+	node, tracked := state.Global.GetVPNNode(containerName)
+	if tracked && !node.ManagedDynamic {
+		return fmt.Errorf("VPN node %q is externally managed", containerName)
+	}
+	state.Global.SetVPNNodeDraining(containerName)
+	cli, err := p.newDockerClient()
 	if err != nil {
 		return err
 	}
 	defer cli.Close()
 
 	containers, err := cli.ContainerList(ctx, container.ListOptions{
-		All:     true,
-		Filters: filters.NewArgs(filters.Arg("name", containerName)),
+		All: true,
 	})
 	if err != nil {
-		slog.Warn("VPN destroy: container list failed", "name", containerName, "err", err)
+		return fmt.Errorf("listing VPN container %q: %w", containerName, err)
 	}
 
+	var targets []dockertypes.Container
 	for _, c := range containers {
+		exact := false
+		for _, name := range c.Names {
+			exact = exact || strings.TrimPrefix(name, "/") == containerName
+		}
+		if !exact {
+			if tracked && node.ContainerID != "" && c.ID == node.ContainerID {
+				return fmt.Errorf("VPN container %q was renamed; retaining its lease", containerName)
+			}
+			continue
+		}
+		if !identity.OwnedVPN(containerName, c.Labels) || (tracked && node.ContainerID != "" && node.ContainerID != c.ID) {
+			return fmt.Errorf("VPN container %q identity or ownership changed", containerName)
+		}
+		targets = append(targets, c)
+	}
+	// Query Docker, not just memory: reindex or exit events may already have
+	// removed an engine record. Failure leaves all leases and state retryable.
+	engines, err := cli.ContainerList(ctx, container.ListOptions{All: true,
+		Filters: filters.NewArgs(filters.Arg("label", "acestream.vpn_container="+containerName)),
+	})
+	if err != nil {
+		return fmt.Errorf("listing dependent engines: %w", err)
+	}
+	cfg := config.C.Load()
+	for _, c := range engines {
+		if c.Labels["acestream.vpn_container"] != containerName {
+			continue
+		}
+		if c.Labels[cfg.ContainerLabelKey] != cfg.ContainerLabelVal || identity.VPNRole("", c.Labels) {
+			return fmt.Errorf("dependent container %q is not a managed engine", c.ID)
+		}
+		if err := cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true}); err != nil && !errdefs.IsNotFound(err) {
+			return fmt.Errorf("removing dependent engine %q: %w", c.ID, err)
+		}
+	}
+	for _, c := range targets {
 		if err := cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true}); err != nil {
-			slog.Warn("VPN destroy: remove failed", "id", c.ID[:12], "err", err)
+			if errdefs.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("removing VPN container %q: %w", c.ID, err)
 		}
 	}
 
-	p.creds.ReleaseAirVPNPort(containerName)
-	p.creds.ReleaseLease(containerName)
+	// Release the lease only after Docker confirms every matching container is
+	// gone. A failed removal must remain retryable and keep its credential
+	// reserved so it cannot be allocated to a second VPN node.
+	if p.creds != nil {
+		p.creds.ReleaseAirVPNPort(containerName)
+		p.creds.ReleaseLease(containerName)
+	}
+	if p.pub != nil {
+		for _, c := range engines {
+			if c.Labels["acestream.vpn_container"] == containerName {
+				p.pub.RemoveEngine(ctx, c.ID)
+			}
+		}
+		for _, e := range state.Global.GetEnginesByVPN(containerName) {
+			p.pub.RemoveEngine(ctx, e.ContainerID)
+		}
+		p.pub.RemoveVPNNode(ctx, containerName)
+	}
 	state.Global.RemoveVPNNode(containerName)
+	for _, e := range state.Global.GetEnginesByVPN(containerName) {
+		if state.Global.RemoveEngine(e.ContainerID) && p.onEngineRemoved != nil {
+			p.onEngineRemoved(e)
+		}
+	}
 	return nil
 }
 
 // ListManagedNodes returns running dynamic VPN containers from Docker.
 func (p *Provisioner) ListManagedNodes(ctx context.Context, includeStopped bool) ([]map[string]interface{}, error) {
-	cli, err := dockerclient.NewClientWithOpts(
-		dockerclient.FromEnv,
-		dockerclient.WithAPIVersionNegotiation(),
-	)
+	cli, err := p.newDockerClient()
 	if err != nil {
 		return nil, err
 	}
@@ -253,6 +347,9 @@ func (p *Provisioner) ListManagedNodes(ctx context.Context, includeStopped bool)
 		for _, n := range c.Names {
 			name = strings.TrimPrefix(n, "/")
 			break
+		}
+		if !identity.OwnedVPN(name, labels) {
+			continue
 		}
 		nodes = append(nodes, map[string]interface{}{
 			"container_id":              c.ID,
@@ -736,6 +833,7 @@ func applyPFFilterGuard(
 
 func buildLabels(provider, protocol, credentialID string, pfSupported bool) map[string]string {
 	labels := map[string]string{
+		identity.DynamicVPNLabel:                  "true",
 		"acestream-orchestrator.managed":          "true",
 		"role":                                    "vpn_node",
 		"acestream.vpn.provider":                  provider,

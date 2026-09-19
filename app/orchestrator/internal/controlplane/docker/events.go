@@ -12,6 +12,7 @@ import (
 
 	"github.com/acestream/acestream/internal/config"
 	"github.com/acestream/acestream/internal/controlplane/engine"
+	"github.com/acestream/acestream/internal/controlplane/identity"
 	"github.com/acestream/acestream/internal/state"
 )
 
@@ -120,9 +121,8 @@ func (w *EventWatcher) handleEvent(ctx context.Context, msg dockertypes.Message)
 	containerName := strings.TrimPrefix(attrs["name"], "/")
 
 	cfg := config.C.Load()
-	isManagedEngine := attrs[cfg.ContainerLabelKey] == cfg.ContainerLabelVal
-	isManagedVPN := attrs["acestream-orchestrator.managed"] == "true" && attrs["role"] == "vpn_node"
-	isDynamicVPN := strings.HasPrefix(strings.ToLower(containerName), "gluetun-dyn-")
+	isManagedVPN := isManagedVPNContainer(containerName, attrs)
+	isManagedEngine := isManagedEngineContainer(containerName, attrs, cfg)
 
 	slog.Debug("docker event", "action", action, "container", containerName, "managed_engine", isManagedEngine, "managed_vpn", isManagedVPN)
 
@@ -134,13 +134,13 @@ func (w *EventWatcher) handleEvent(ctx context.Context, msg dockertypes.Message)
 		} else if strings.Contains(action, "unhealthy") {
 			status = "unhealthy"
 		}
-		w.handleHealthStatus(ctx, containerID, containerName, status, attrs, isManagedVPN || isDynamicVPN)
+		w.handleHealthStatus(ctx, containerID, containerName, status, attrs, isManagedVPN)
 
 	case action == "start":
 		if isManagedEngine {
 			w.handleEngineStart(ctx, containerID, containerName, attrs)
 		}
-		if isManagedVPN || isDynamicVPN {
+		if isManagedVPN {
 			w.handleVPNStart(ctx, containerID, containerName, attrs)
 		}
 
@@ -148,7 +148,7 @@ func (w *EventWatcher) handleEvent(ctx context.Context, msg dockertypes.Message)
 		if isManagedEngine {
 			w.handleEngineStop(ctx, containerID, containerName, attrs)
 		}
-		if isManagedVPN || isDynamicVPN {
+		if isManagedVPN {
 			w.handleVPNStop(ctx, containerName)
 		}
 	}
@@ -256,7 +256,7 @@ func (w *EventWatcher) handleVPNStart(ctx context.Context, containerID, containe
 		Healthy:                 false, // until health_status:healthy event
 		Condition:               "",
 		Provider:                provider,
-		ManagedDynamic:          strings.HasPrefix(strings.ToLower(containerName), "gluetun-dyn-"),
+		ManagedDynamic:          identity.OwnedVPN(containerName, attrs),
 		PortForwardingSupported: attrs["port_forwarding_supported"] == "true",
 		Lifecycle:               "active",
 	}
@@ -277,7 +277,25 @@ func (w *EventWatcher) handleVPNStart(ctx context.Context, containerID, containe
 }
 
 func (w *EventWatcher) handleVPNStop(ctx context.Context, containerName string) {
-	if state.Global.RemoveVPNNode(containerName) {
+	st := state.Global
+	if node, ok := st.GetVPNNode(containerName); ok && node.ManagedDynamic {
+		st.SetVPNNodeHealthy(containerName, false)
+		st.SetVPNNodeStatus(containerName, "stopped")
+		if updated, ok := st.GetVPNNode(containerName); ok {
+			w.pub.PublishVPNNode(ctx, updated)
+		}
+		slog.Info("VPN node marked stopped", "name", containerName)
+		state.RecordEvent(state.EventEntry{
+			EventType: "vpn",
+			Category:  "stopped",
+			Message:   "VPN node marked stopped",
+			Details: map[string]any{
+				"name": containerName,
+			},
+		})
+		return
+	}
+	if st.RemoveVPNNode(containerName) {
 		w.pub.RemoveVPNNode(ctx, containerName)
 		slog.Info("VPN node deregistered", "name", containerName)
 		state.RecordEvent(state.EventEntry{

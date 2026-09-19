@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -37,14 +38,18 @@ type Config struct {
 	SSEUpdateInterval     time.Duration
 
 	// ── Proxy: timeouts ──────────────────────────────────────────────────────
-	UpstreamConnectTimeout time.Duration
-	UpstreamReadTimeout    time.Duration
-	ClientWaitTimeout      time.Duration
-	StreamTimeout          time.Duration
-	ChunkTimeout           time.Duration
-	ChannelShutdownDelay   time.Duration
-	ChannelInitGracePeriod time.Duration
-	KeepaliveInterval      time.Duration
+	UpstreamConnectTimeout   time.Duration
+	UpstreamReadTimeout      time.Duration
+	StreamStallTimeout       time.Duration
+	StreamStallCheckInterval time.Duration
+	StreamStallCooldown      time.Duration
+	StreamStallMaxRecoveries int
+	ClientWaitTimeout        time.Duration
+	StreamTimeout            time.Duration
+	ChunkTimeout             time.Duration
+	ChannelShutdownDelay     time.Duration
+	ChannelInitGracePeriod   time.Duration
+	KeepaliveInterval        time.Duration
 
 	// ── Proxy: buffer ────────────────────────────────────────────────────────
 	BufferChunkSize     int
@@ -462,14 +467,18 @@ func load() *Config {
 		CountsPublishInterval: envDur("COUNTS_PUBLISH_INTERVAL_S", 5*time.Second),
 		SSEUpdateInterval:     envDur("SSE_UPDATE_INTERVAL_S", 1*time.Second),
 
-		UpstreamConnectTimeout: envDur("UPSTREAM_CONNECT_TIMEOUT_S", 3*time.Second),
-		UpstreamReadTimeout:    envDur("UPSTREAM_READ_TIMEOUT_S", 90*time.Second),
-		ClientWaitTimeout:      envDur("CLIENT_WAIT_TIMEOUT_S", 60*time.Second),
-		StreamTimeout:          envDur("STREAM_TIMEOUT_S", 60*time.Second),
-		ChunkTimeout:           envDur("CHUNK_TIMEOUT_S", 5*time.Second),
-		ChannelShutdownDelay:   envDur("CHANNEL_SHUTDOWN_DELAY_S", 5*time.Second),
-		ChannelInitGracePeriod: envDur("CHANNEL_INIT_GRACE_PERIOD_S", 30*time.Second),
-		KeepaliveInterval:      envDur("KEEPALIVE_INTERVAL_MS", 500*time.Millisecond),
+		UpstreamConnectTimeout:   envDur("UPSTREAM_CONNECT_TIMEOUT_S", 3*time.Second),
+		UpstreamReadTimeout:      envDur("UPSTREAM_READ_TIMEOUT_S", 90*time.Second),
+		StreamStallTimeout:       recoveryDuration("STREAM_STALL_TIMEOUT_S", 0, true),
+		StreamStallCheckInterval: recoveryDuration("STREAM_STALL_CHECK_INTERVAL_S", 5*time.Second, false),
+		StreamStallCooldown:      recoveryDuration("STREAM_STALL_COOLDOWN_S", 30*time.Second, false),
+		StreamStallMaxRecoveries: max(1, envInt("STREAM_STALL_MAX_RECOVERIES", 3)),
+		ClientWaitTimeout:        envDur("CLIENT_WAIT_TIMEOUT_S", 60*time.Second),
+		StreamTimeout:            envDur("STREAM_TIMEOUT_S", 60*time.Second),
+		ChunkTimeout:             envDur("CHUNK_TIMEOUT_S", 5*time.Second),
+		ChannelShutdownDelay:     envDur("CHANNEL_SHUTDOWN_DELAY_S", 5*time.Second),
+		ChannelInitGracePeriod:   envDur("CHANNEL_INIT_GRACE_PERIOD_S", 30*time.Second),
+		KeepaliveInterval:        envDur("KEEPALIVE_INTERVAL_MS", 500*time.Millisecond),
 
 		BufferChunkSize:     aligned,
 		InitialBehindChunks: envInt("INITIAL_BEHIND_CHUNKS", 4),
@@ -594,6 +603,15 @@ func load() *Config {
 }
 
 // ── Env helpers ───────────────────────────────────────────────────────────────
+
+func recoveryDuration(key string, fallback time.Duration, allowZero bool) time.Duration {
+	value := envDur(key, fallback)
+	if value < 0 || (!allowZero && value == 0) {
+		slog.Warn("Invalid stream recovery duration; using default", "setting", key)
+		return fallback
+	}
+	return value
+}
 
 func envStr(k, def string) string {
 	if v := os.Getenv(k); v != "" {

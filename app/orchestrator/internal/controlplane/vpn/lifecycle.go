@@ -8,9 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	dockerclient "github.com/docker/docker/client"
-
 	"github.com/acestream/acestream/internal/config"
 	"github.com/acestream/acestream/internal/state"
 )
@@ -28,7 +25,6 @@ type LifecycleManager struct {
 	activeHealings sync.Map
 	nudge          chan struct{}
 	nudger         func(string)
-	engineStopper  func(context.Context, string)
 	wg             sync.WaitGroup
 }
 
@@ -49,10 +45,6 @@ func NewLifecycleManager(pub *state.RedisPublisher, prov *Provisioner) *Lifecycl
 
 func (lm *LifecycleManager) SetNudger(f func(string)) {
 	lm.nudger = f
-}
-
-func (lm *LifecycleManager) SetEngineStopper(f func(context.Context, string)) {
-	lm.engineStopper = f
 }
 
 func (lm *LifecycleManager) Nudge(reason string) {
@@ -100,15 +92,16 @@ func (lm *LifecycleManager) Run(ctx context.Context) {
 func (lm *LifecycleManager) reconcile(ctx context.Context) {
 	cfg := config.C.Load()
 
-	// Phase 1: heal unhealthy nodes.
-	lm.healNotReady(ctx)
-
-	// Phase 2: scale up/down if VPN provisioning is enabled.
+	// Sync Docker state before healing so a missed stop event is handled by the
+	// recovery path and does not leave a lease orphaned.
 	if cfg.VPNEnabled && lm.prov != nil {
 		lm.reconcileScale(ctx)
 	}
 
-	// Phase 3: auto-drain dynamic nodes that have been unhealthy too long.
+	// Heal only after the Docker snapshot has been reconciled.
+	lm.healNotReady(ctx)
+
+	// Auto-drain dynamic nodes that have been unhealthy too long.
 	for _, node := range state.Global.ListVPNNodes() {
 		if node.Lifecycle == "draining" {
 			lm.gcDraining(ctx, node)
@@ -129,7 +122,7 @@ func (lm *LifecycleManager) reconcile(ctx context.Context) {
 					},
 				})
 				if state.Global.SetVPNNodeDraining(node.ContainerName) {
-					lm.pub.PublishVPNNode(ctx, node)
+					lm.publishNode(ctx, node.ContainerName)
 				}
 			}
 		}
@@ -144,6 +137,7 @@ func (lm *LifecycleManager) reconcileScale(ctx context.Context) {
 	// Sync Docker-running managed nodes into state first.
 	if err := lm.syncManagedNodesToState(ctx); err != nil {
 		slog.Warn("Failed to sync VPN node state from Docker", "err", err)
+		return // Do not scale using an unavailable Docker snapshot.
 	}
 
 	// Compute desired VPN count from engine demand.
@@ -322,7 +316,7 @@ func (lm *LifecycleManager) scaleDownIdle(ctx context.Context, desiredVPNs int) 
 			},
 		})
 		if st.SetVPNNodeDraining(node.ContainerName) {
-			lm.pub.PublishVPNNode(ctx, node)
+			lm.publishNode(ctx, node.ContainerName)
 		}
 	}
 }
@@ -337,7 +331,7 @@ func (lm *LifecycleManager) healNotReady(ctx context.Context) {
 			continue
 		}
 		// Grace: only heal if last-seen is past the configured threshold.
-		if time.Since(node.LastSeen) < cfg.VPNHealGracePeriod {
+		if !nodeNeedsHealing(node, time.Now().UTC(), cfg.VPNHealGracePeriod) {
 			continue
 		}
 		lm.activeHealings.Store(name, struct{}{})
@@ -351,10 +345,14 @@ func (lm *LifecycleManager) healNotReady(ctx context.Context) {
 			},
 		})
 		if state.Global.SetVPNNodeDraining(name) {
-			lm.pub.PublishVPNNode(ctx, node)
+			lm.publishNode(ctx, node.ContainerName)
 		}
 		lm.activeHealings.Delete(name)
 	}
+}
+
+func nodeNeedsHealing(node *state.VPNNode, now time.Time, grace time.Duration) bool {
+	return node != nil && node.UnhealthySince != nil && now.Sub(*node.UnhealthySince) >= grace
 }
 
 // gcDraining checks whether all engines attached to a draining VPN node are
@@ -407,6 +405,9 @@ func (lm *LifecycleManager) gcDraining(ctx context.Context, node *state.VPNNode)
 }
 
 func (lm *LifecycleManager) destroyVPN(ctx context.Context, node *state.VPNNode) {
+	if !node.ManagedDynamic || lm.prov == nil {
+		return
+	}
 	slog.Info("Destroying draining VPN node", "name", node.ContainerName)
 	state.RecordEvent(state.EventEntry{
 		EventType: "vpn",
@@ -417,41 +418,12 @@ func (lm *LifecycleManager) destroyVPN(ctx context.Context, node *state.VPNNode)
 		},
 	})
 
-	if lm.prov != nil {
-		if err := lm.prov.DestroyNode(ctx, node.ContainerName); err != nil {
-			slog.Error("Failed to destroy VPN node", "name", node.ContainerName, "err", err)
-			state.RecordEvent(state.EventEntry{
-				EventType: "vpn",
-				Category:  "destroy_failed",
-				Message:   "Failed to destroy VPN node",
-				Details: map[string]any{
-					"name":  node.ContainerName,
-					"error": err.Error(),
-				},
-			})
-		}
-	} else {
-		// Fallback: direct Docker stop (no credential management).
-		if err := stopVPNContainer(ctx, node.ContainerID); err != nil {
-			slog.Error("Failed to stop VPN container", "name", node.ContainerName, "err", err)
-			state.RecordEvent(state.EventEntry{
-				EventType: "vpn",
-				Category:  "destroy_failed",
-				Message:   "Failed to stop VPN container",
-				Details: map[string]any{
-					"name":  node.ContainerName,
-					"error": err.Error(),
-				},
-			})
-		}
+	if err := lm.prov.DestroyNode(ctx, node.ContainerName); err != nil {
+		slog.Error("Failed to destroy VPN node", "name", node.ContainerName, "err", err)
+		state.RecordEvent(state.EventEntry{EventType: "vpn", Category: "destroy_failed",
+			Message: "Failed to destroy VPN node", Details: map[string]any{"name": node.ContainerName, "error": err.Error()}})
+		return
 	}
-
-	if lm.engineStopper != nil {
-		lm.engineStopper(ctx, node.ContainerName)
-	}
-	state.Global.RemoveEnginesByVPN(node.ContainerName)
-	state.Global.RemoveVPNNode(node.ContainerName)
-	lm.pub.RemoveVPNNode(ctx, node.ContainerName)
 	slog.Info("VPN node destroyed", "name", node.ContainerName)
 	state.RecordEvent(state.EventEntry{
 		EventType: "vpn",
@@ -460,6 +432,45 @@ func (lm *LifecycleManager) destroyVPN(ctx context.Context, node *state.VPNNode)
 		Details: map[string]any{
 			"name": node.ContainerName,
 		},
+	})
+}
+
+func isTerminalNodeStatus(status string) bool {
+	switch status {
+	case "stopped", "exited", "dead":
+		return true
+	default:
+		return false
+	}
+}
+
+func (lm *LifecycleManager) recoverStoppedNode(ctx context.Context, name string) {
+	if name == "" || lm.prov == nil {
+		return
+	}
+	if node, ok := state.Global.GetVPNNode(name); ok && !node.ManagedDynamic {
+		return
+	}
+	state.Global.SetVPNNodeHealthy(name, false)
+	state.Global.SetVPNNodeDraining(name)
+	if err := lm.prov.DestroyNode(ctx, name); err != nil {
+		slog.Error("Failed to recover stopped VPN node", "name", name, "err", err)
+		state.RecordEvent(state.EventEntry{
+			EventType: "vpn",
+			Category:  "recovery_failed",
+			Message:   "Failed to recover stopped VPN node",
+			Details:   map[string]any{"name": name, "error": err.Error()},
+		})
+		return
+	}
+	if lm.pub != nil {
+		lm.pub.RemoveVPNNode(ctx, name)
+	}
+	state.RecordEvent(state.EventEntry{
+		EventType: "vpn",
+		Category:  "recovered",
+		Message:   "Stopped VPN node cleaned up",
+		Details:   map[string]any{"name": name},
 	})
 }
 
@@ -505,10 +516,12 @@ func (lm *LifecycleManager) syncManagedNodesToState(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	return lm.syncManagedSnapshot(ctx, nodes, time.Now().UTC())
+}
 
+func (lm *LifecycleManager) syncManagedSnapshot(ctx context.Context, nodes []map[string]interface{}, now time.Time) error {
 	st := state.Global
 	observed := make(map[string]bool)
-	now := time.Now().UTC()
 
 	for _, n := range nodes {
 		name, _ := n["container_name"].(string)
@@ -516,12 +529,26 @@ func (lm *LifecycleManager) syncManagedNodesToState(ctx context.Context) error {
 			continue
 		}
 		observed[name] = true
+		status, _ := n["status"].(string)
+		if existing, ok := st.GetVPNNode(name); ok && !existing.ManagedDynamic {
+			continue
+		}
+		if isTerminalNodeStatus(status) {
+			if _, exists := st.GetVPNNode(name); !exists {
+				st.UpsertVPNNode(&state.VPNNode{ContainerName: name, ContainerID: strVal(n["container_id"]), ManagedDynamic: true, Status: status})
+			}
+			lm.recoverStoppedNode(ctx, name)
+			continue
+		}
 
-		existing, exists := st.GetVPNNode(name)
+		_, exists := st.GetVPNNode(name)
 		if exists {
-			// Update status/LastSeen but don't overwrite lifecycle/health state.
-			existing.Status, _ = n["status"].(string)
-			existing.LastSeen = now
+			// Update status without resetting health timestamps. In particular,
+			// created/restarting containers are not cleanup triggers.
+			st.SetVPNNodeStatus(name, status)
+			continue
+		}
+		if status != "running" {
 			continue
 		}
 
@@ -535,7 +562,7 @@ func (lm *LifecycleManager) syncManagedNodesToState(ctx context.Context) error {
 		st.UpsertVPNNode(&state.VPNNode{
 			ContainerName:           name,
 			ContainerID:             containerID,
-			Status:                  strVal(n["status"]),
+			Status:                  status,
 			Provider:                provider,
 			Protocol:                protocol,
 			CredentialID:            credID,
@@ -548,9 +575,10 @@ func (lm *LifecycleManager) syncManagedNodesToState(ctx context.Context) error {
 
 	// Mark nodes gone from Docker as down.
 	for _, node := range st.ListDynamicVPNNodes() {
-		if !observed[node.ContainerName] && node.Lifecycle != "draining" {
-			node.Status = "down"
-			node.LastSeen = now
+		if !observed[node.ContainerName] && now.Sub(node.FirstSeen) >= 30*time.Second {
+			st.SetVPNNodeHealthy(node.ContainerName, false)
+			st.SetVPNNodeStatus(node.ContainerName, "down")
+			lm.recoverStoppedNode(ctx, node.ContainerName)
 		}
 	}
 
@@ -558,6 +586,14 @@ func (lm *LifecycleManager) syncManagedNodesToState(ctx context.Context) error {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+func (lm *LifecycleManager) publishNode(ctx context.Context, name string) {
+	if lm.pub != nil {
+		if node, ok := state.Global.GetVPNNode(name); ok {
+			lm.pub.PublishVPNNode(ctx, node)
+		}
+	}
+}
 
 func countVPNEngines() int {
 	n := 0
@@ -567,23 +603,6 @@ func countVPNEngines() int {
 		}
 	}
 	return n
-}
-
-// stopVPNContainer is the fallback when no Provisioner is available.
-func stopVPNContainer(ctx context.Context, containerID string) error {
-	if containerID == "" {
-		return nil
-	}
-	cli, err := dockerclient.NewClientWithOpts(
-		dockerclient.FromEnv,
-		dockerclient.WithAPIVersionNegotiation(),
-	)
-	if err != nil {
-		return err
-	}
-	defer cli.Close()
-	timeout := 15
-	return cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeout})
 }
 
 func max(a, b int) int {

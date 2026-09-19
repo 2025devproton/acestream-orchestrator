@@ -30,8 +30,8 @@ type Store struct {
 
 	vpnPending             map[string]int  // per-VPN pending engine counter
 	enginePending          map[string]int  // containerID -> in-flight stream reservations (claimed but not yet started)
-	streamCounts     map[string]int  // containerID -> active stream count
-	forwardedPending map[string]bool // vpnContainer -> pending flag
+	streamCounts           map[string]int  // containerID -> active stream count
+	forwardedPending       map[string]bool // vpnContainer -> pending flag
 	lookaheadLayer         *int
 	emptyAt                map[string]time.Time // containerID -> time first became empty
 	targetConfigHash       string
@@ -427,12 +427,30 @@ func (s *Store) TryClaimForwardedSlot(vpn string) bool {
 func (s *Store) UpsertVPNNode(n *VPNNode) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.vpnNodes[n.ContainerName]; ok {
+	n = cloneVPNNode(n)
+	now := time.Now().UTC()
+	if existing, ok := s.vpnNodes[n.ContainerName]; ok && (existing.ContainerID == n.ContainerID || n.ContainerID == "" || existing.ContainerID == "") {
 		n.FirstSeen = existing.FirstSeen
+		if !n.Healthy && !existing.Healthy {
+			n.UnhealthySince = existing.UnhealthySince
+		}
+		if existing.Lifecycle == "draining" {
+			n.Lifecycle = existing.Lifecycle
+			n.DrainingSince = existing.DrainingSince
+		}
 	} else {
-		n.FirstSeen = time.Now().UTC()
+		n.FirstSeen = now
 	}
-	n.LastSeen = time.Now().UTC()
+	if !n.Healthy && n.UnhealthySince == nil {
+		unhealthySince := now
+		n.UnhealthySince = &unhealthySince
+	}
+	if n.Healthy {
+		n.UnhealthySince = nil
+	} else {
+		n.HealthySince = nil
+	}
+	n.LastSeen = now
 	s.vpnNodes[n.ContainerName] = n
 }
 
@@ -440,7 +458,7 @@ func (s *Store) GetVPNNode(name string) (*VPNNode, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	n, ok := s.vpnNodes[name]
-	return n, ok
+	return cloneVPNNode(n), ok
 }
 
 func (s *Store) RemoveVPNNode(name string) bool {
@@ -458,7 +476,7 @@ func (s *Store) ListVPNNodes() []*VPNNode {
 	defer s.mu.RUnlock()
 	out := make([]*VPNNode, 0, len(s.vpnNodes))
 	for _, n := range s.vpnNodes {
-		out = append(out, n)
+		out = append(out, cloneVPNNode(n))
 	}
 	return out
 }
@@ -482,14 +500,27 @@ func (s *Store) SetVPNNodeHealthy(name string, healthy bool) {
 	prev := n.Healthy
 	n.Healthy = healthy
 	n.LastSeen = time.Now().UTC()
-	if !healthy && prev {
-		now := time.Now().UTC()
-		n.UnhealthySince = &now
+	if !healthy {
+		if prev || n.UnhealthySince == nil {
+			now := time.Now().UTC()
+			n.UnhealthySince = &now
+		}
 		n.HealthySince = nil // reset so next healthy transition is tracked fresh
-	} else if healthy && !prev {
-		now := time.Now().UTC()
+	} else {
 		n.UnhealthySince = nil
-		n.HealthySince = &now
+		if !prev || n.HealthySince == nil {
+			now := time.Now().UTC()
+			n.HealthySince = &now
+		}
+	}
+}
+
+func (s *Store) SetVPNNodeStatus(name, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n, ok := s.vpnNodes[name]; ok {
+		n.Status = status
+		n.LastSeen = time.Now().UTC()
 	}
 }
 
@@ -537,7 +568,7 @@ func (s *Store) ListDrainingVPNNodes() []*VPNNode {
 	var out []*VPNNode
 	for _, n := range s.vpnNodes {
 		if n.Lifecycle == "draining" {
-			out = append(out, n)
+			out = append(out, cloneVPNNode(n))
 		}
 	}
 	return out
@@ -549,7 +580,7 @@ func (s *Store) ListDynamicVPNNodes() []*VPNNode {
 	var out []*VPNNode
 	for _, n := range s.vpnNodes {
 		if n.ManagedDynamic {
-			out = append(out, n)
+			out = append(out, cloneVPNNode(n))
 		}
 	}
 	return out
@@ -561,7 +592,7 @@ func (s *Store) ListNotReadyVPNNodes() []*VPNNode {
 	var out []*VPNNode
 	for _, n := range s.vpnNodes {
 		if n.ManagedDynamic && !n.Healthy && n.Lifecycle != "draining" {
-			out = append(out, n)
+			out = append(out, cloneVPNNode(n))
 		}
 	}
 	return out

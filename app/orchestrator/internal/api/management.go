@@ -593,8 +593,13 @@ func (s *ProxyServer) mgHandleProvisionVPNNode(w http.ResponseWriter, r *http.Re
 
 func (s *ProxyServer) mgHandleDrainVPNNode(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if _, ok := s.st.GetVPNNode(name); !ok {
+	node, ok := s.st.GetVPNNode(name)
+	if !ok {
 		mgWriteJSON(w, http.StatusNotFound, map[string]string{"error": "VPN node not found"})
+		return
+	}
+	if !node.ManagedDynamic {
+		mgWriteJSON(w, http.StatusConflict, map[string]string{"error": "VPN node is externally managed"})
 		return
 	}
 	s.st.SetVPNNodeDraining(name)
@@ -608,6 +613,10 @@ func (s *ProxyServer) mgHandleDrainVPNNode(w http.ResponseWriter, r *http.Reques
 
 func (s *ProxyServer) mgHandleDestroyVPNNode(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	if node, ok := s.st.GetVPNNode(name); ok && !node.ManagedDynamic {
+		mgWriteJSON(w, http.StatusConflict, map[string]string{"error": "VPN node is externally managed"})
+		return
+	}
 	if s.prov == nil {
 		mgWriteJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "VPN provisioner not available"})
 		return

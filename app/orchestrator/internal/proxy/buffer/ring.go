@@ -80,7 +80,8 @@ type RingBuffer struct {
 	stopped    bool
 
 	// Freshness
-	lastWriteTime time.Time
+	lastWriteTime      time.Time
+	lastChunkWriteTime time.Time
 
 	// generation is incremented on every Reset so consumers can detect
 	// buffer resets and re-anchor their read cursors.
@@ -171,6 +172,9 @@ func (rb *RingBuffer) Write(data []byte) int {
 	}
 
 	rb.partial = aligned
+	if written > 0 {
+		rb.lastChunkWriteTime = time.Now()
+	}
 	rb.mu.Unlock()
 
 	if written > 0 {
@@ -332,6 +336,24 @@ func (rb *RingBuffer) IsFresh(maxSilence time.Duration) bool {
 	return time.Since(t) <= maxSilence
 }
 
+// IsChunkFresh reports completed buffer-chunk progress, not media decodability.
+func (rb *RingBuffer) IsChunkFresh(maxSilence time.Duration) bool {
+	rb.mu.RLock()
+	t := rb.lastChunkWriteTime
+	rb.mu.RUnlock()
+	if t.IsZero() {
+		return false
+	}
+	return time.Since(t) <= maxSilence
+}
+
+// LastChunkWriteTime is zero until a full chunk is emitted in this generation.
+func (rb *RingBuffer) LastChunkWriteTime() time.Time {
+	rb.mu.RLock()
+	defer rb.mu.RUnlock()
+	return rb.lastChunkWriteTime
+}
+
 // ─── Metrics ─────────────────────────────────────────────────────────────────
 
 // TargetChunkSize returns the target byte size of each chunk.
@@ -369,6 +391,7 @@ func (rb *RingBuffer) Reset() {
 		rb.slots[i] = nil
 	}
 	rb.lastWriteTime = time.Time{}
+	rb.lastChunkWriteTime = time.Time{}
 	rb.pcrSamples = [pcrWindowSize]pcrSample{}
 	rb.pcrHead = 0
 	rb.pcrCount = 0

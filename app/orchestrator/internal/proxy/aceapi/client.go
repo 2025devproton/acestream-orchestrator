@@ -3,6 +3,7 @@ package aceapi
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha1"
 	"encoding/json"
 	"fmt"
@@ -54,9 +55,10 @@ type Client struct {
 	readTimeout    time.Duration
 	productKey     string
 
-	mu   sync.Mutex
-	conn net.Conn
-	rd   *bufio.Reader
+	mu          sync.Mutex
+	conn        net.Conn
+	rd          *bufio.Reader
+	stopContext func() bool
 
 	authenticated bool
 	httpPort      int // actual HTTP port reported by engine in HELLOTS (0 = not yet known)
@@ -85,14 +87,21 @@ func New(host string, port int) *Client {
 
 // Connect opens the TCP connection to the AceStream API port.
 func (c *Client) Connect() error {
+	return c.ConnectContext(context.Background())
+}
+
+// ConnectContext also interrupts authentication/START reads on cancellation.
+func (c *Client) ConnectContext(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", c.host, c.port), c.connectTimeout)
+	dialer := net.Dialer{Timeout: c.connectTimeout}
+	conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", c.host, c.port))
 	if err != nil {
 		return fmt.Errorf("ace_api connect %s:%d: %w", c.host, c.port, err)
 	}
 	c.conn = conn
+	c.stopContext = context.AfterFunc(ctx, func() { _ = conn.Close() })
 	c.rd = bufio.NewReader(conn)
 	c.authenticated = false
 	slog.Debug("ace_api connected", "host", c.host, "port", c.port)
@@ -103,6 +112,10 @@ func (c *Client) Connect() error {
 func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.stopContext != nil {
+		c.stopContext()
+		c.stopContext = nil
+	}
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil

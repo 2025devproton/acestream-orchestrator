@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/acestream/acestream/internal/controlplane/identity"
 	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -247,28 +248,6 @@ func StopContainer(ctx context.Context, containerID string, force bool) error {
 	return cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeout})
 }
 
-// StopEnginesByVPN stops all engines associated with the given VPN container.
-func StopEnginesByVPN(ctx context.Context, vpnName string) {
-	st := state.Global
-	engines := st.GetEnginesByVPN(vpnName)
-	if len(engines) == 0 {
-		return
-	}
-
-	slog.Info("stopping engines associated with VPN", "vpn", vpnName, "count", len(engines))
-	var wg sync.WaitGroup
-	for _, e := range engines {
-		wg.Add(1)
-		go func(id string) {
-			defer wg.Done()
-			if err := StopContainer(ctx, id, true); err != nil {
-				slog.Warn("failed to stop engine on VPN destruction", "id", id[:min12(len(id))], "err", err)
-			}
-		}(e.ContainerID)
-	}
-	wg.Wait()
-}
-
 // ListManagedContainers returns all running containers with the managed label.
 func ListManagedContainers(ctx context.Context) ([]dockertypes.Container, error) {
 	cli, err := newDockerClient()
@@ -282,7 +261,18 @@ func ListManagedContainers(ctx context.Context) ([]dockertypes.Container, error)
 	f.Add("label", fmt.Sprintf("%s=%s", cfg.ContainerLabelKey, cfg.ContainerLabelVal))
 	f.Add("status", "running")
 
-	return cli.ContainerList(ctx, container.ListOptions{Filters: f, All: false})
+	containers, err := cli.ContainerList(ctx, container.ListOptions{Filters: f, All: false})
+	var engines []dockertypes.Container
+	for _, c := range containers {
+		name := ""
+		if len(c.Names) > 0 {
+			name = c.Names[0]
+		}
+		if !identity.VPNRole(name, c.Labels) {
+			engines = append(engines, c)
+		}
+	}
+	return engines, err
 }
 
 // ListManagedVPNContainers returns running Gluetun dynamic containers.
@@ -298,7 +288,14 @@ func ListManagedVPNContainers(ctx context.Context) ([]dockertypes.Container, err
 	f.Add("label", "role=vpn_node")
 	f.Add("status", "running")
 
-	return cli.ContainerList(ctx, container.ListOptions{Filters: f, All: false})
+	containers, err := cli.ContainerList(ctx, container.ListOptions{Filters: f, All: false})
+	var owned []dockertypes.Container
+	for _, c := range containers {
+		if len(c.Names) > 0 && identity.OwnedVPN(c.Names[0], c.Labels) {
+			owned = append(owned, c)
+		}
+	}
+	return owned, err
 }
 
 // StopAllManaged stops all managed engines and VPN nodes in parallel.

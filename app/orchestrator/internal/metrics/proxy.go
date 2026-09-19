@@ -6,6 +6,15 @@ import (
 )
 
 var (
+	StreamRecoveryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "acestream_proxy_stream_recovery_total",
+		Help: "Buffer-progress recovery attempts and outcomes (attempted, resumed, failed, exhausted).",
+	}, []string{"outcome"})
+	StreamRecoveryDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "acestream_proxy_stream_recovery_duration_seconds",
+		Help:    "Time from recovery attempt to the first observed complete buffer chunk.",
+		Buckets: prometheus.ExponentialBuckets(1, 2, 9),
+	})
 	HttpRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "acestream_proxy_http_requests_total",
 		Help: "The total number of HTTP requests processed by the proxy.",
