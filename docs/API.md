@@ -2,6 +2,31 @@
 
 Auth: add `Authorization: Bearer <API_KEY>` in protected endpoints.
 
+## M3U playlist rewriting
+
+### GET /api/v1/modify_m3u
+
+Fetches a playlist and rewrites AceStream entries to the orchestrator's
+`/ace/getstream` endpoint. Query parameters:
+
+- `m3u_url`: HTTP(S) source URL, URL-encoded when embedded in the query.
+- `url`: legacy alias used when `m3u_url` is absent.
+- `host`, `port`: optional destination overrides for rewritten entries; by default
+  the request host and scheme are used.
+
+Success returns HTTP 200 with `Content-Type: application/x-mpegurl`. Existing
+`acestream://`, `ace://`, and localhost/127.0.0.1 `/ace/getstream` URLs are
+rewritten; other entries are preserved.
+
+Missing source URLs or unsupported schemes return HTTP 400. Invalid M3U fetch
+configuration returns HTTP 500. Upstream non-2xx responses, transport failures,
+and body read failures (including timeouts) return HTTP 502 with a JSON error,
+rather than a successful partial playlist. Redirects follow the standard Go
+HTTP client policy. The total download timeout defaults to 30 seconds.
+
+See [M3U configuration](CONFIG.md#m3u-downloads-through-an-http-proxy) for
+`M3U_FETCH_TIMEOUT_S` and `M3U_FETCH_PROXY_URL`, including WARP proxy usage.
+
 ## Provisioning
 ### POST /provision
 Creates container with generic parameters (not AceStream).

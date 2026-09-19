@@ -133,9 +133,38 @@ All variables below can be set in your `docker-compose.yml` or passed via a `.en
 | `CONTAINER_LABEL` | `ondemand.app=myservice` | Docker label (`key=value`) applied to managed engine containers. |
 | `DB_URL` | `sqlite:///.../app/config/orchestrator.db` | SQLAlchemy database URL. Default resolves to the repository `app/config/orchestrator.db` path (inside container: `/app/app/config/orchestrator.db`), so runtime settings persist on the mounted `./config` volume without extra compose configuration. |
 | `AUTO_DELETE` | `true` | Delete idle engines automatically when `IDLE_TTL_S` elapses. |
-| `M3U_TIMEOUT` | `15` | Seconds to wait when fetching an M3U playlist. |
+| `M3U_FETCH_TIMEOUT_S` | `30` | Total M3U download timeout, including redirects and reading the body; integer seconds from `1` to `300`. Environment only. |
+| `M3U_FETCH_PROXY_URL` | *(none)* | HTTP(S) proxy used only for M3U downloads, e.g. `http://warp-proxy:3128`. Environment only. |
 | `DEBUG_MODE` | `false` | **[UI]** Enable verbose debug logging. |
 | `MONITOR_INTERVAL_S` | `10` | Seconds between Docker container state polls. |
+
+### M3U downloads through an HTTP proxy
+
+`GET /api/v1/modify_m3u` can fetch its source playlist through an existing
+HTTP(S) proxy, including one with WARP egress. Set these variables on the
+**orchestrator container** (they are not dashboard or SQLite settings):
+
+```yaml
+services:
+  orchestrator:
+    environment:
+      M3U_FETCH_PROXY_URL: "http://warp-proxy:3128"
+      M3U_FETCH_TIMEOUT_S: "30"
+```
+
+Replace the example address with your proxy's HTTP listener reachable from the
+orchestrator container. This does not deploy WARP or change engine, stream, or
+Gluetun routing. SOCKS URLs are not supported by this setting. An explicit proxy
+applies to every playlist download, overriding `HTTP_PROXY`, `HTTPS_PROXY`, and
+`NO_PROXY` for these requests. If unset or blank, the standard Go transport's
+environment proxy behavior is preserved.
+
+The timeout defaults to 30 seconds; it accepts integer seconds, not Go duration
+strings. Invalid configuration returns HTTP 500 when the endpoint is called.
+Upstream non-2xx responses, connection failures, timeouts, and body read failures
+return HTTP 502, without returning a partial playlist. Client cancellation also
+cancels the upstream request. The old documented `M3U_TIMEOUT` variable is not
+read by the Go endpoint; use `M3U_FETCH_TIMEOUT_S` instead.
 
 ### Engine Lifecycle
 

@@ -1,14 +1,16 @@
-# Improve dynamic VPN recovery, stalled stream handling, and runtime health checks
+# Improve VPN and stream recovery, runtime health checks, and M3U fetching
 
 ## Summary
 
-This change applies the useful recovery behavior from the downstream patches and
+This change integrates the useful behavior from downstream patches 0001–0003 and
 addresses the lifecycle, ownership, retry, and observability issues found during
 review.
 
 It improves dynamic VPN recovery, adds bounded opt-in stream recovery, separates
 liveness from serving and provisioning readiness, and makes critical runtime
-process failures visible to Docker's restart policy.
+process failures visible to Docker's restart policy. It also adds bounded M3U
+downloads through an optional HTTP(S) proxy, including an existing WARP egress
+proxy.
 
 ## Problem
 
@@ -23,6 +25,9 @@ process failures visible to Docker's restart policy.
 - The health endpoint reported API liveness but was not sufficient to express
   serving capacity or provisioning availability.
 - The startup supervisor could exit successfully after a critical child failed.
+
+- M3U downloads used an unbounded default client and could turn upstream HTTP
+  errors or interrupted bodies into successful playlist responses.
 
 ## Changes
 
@@ -76,6 +81,25 @@ completed buffer chunks, not verified media decodability.
   when either critical process exits unexpectedly.
 - Add CI for the race-enabled Go suite and Python probe/supervisor tests.
 
+### M3U fetching (patch 0003)
+
+- Add `M3U_FETCH_PROXY_URL` for a playlist-only HTTP(S) proxy and
+  `M3U_FETCH_TIMEOUT_S` for a total download timeout (default 30 seconds,
+  valid range 1–300 integer seconds).
+- Preserve standard environment proxy behavior when no explicit proxy is set.
+- Return HTTP 500 for invalid fetch configuration and HTTP 502 for upstream
+  non-2xx statuses, transport errors, and incomplete body reads.
+- Close idle connections owned by each request's cloned transport.
+- Propagate scanner read errors so timeouts cannot return a partial HTTP 200
+  playlist; preserve separate lines when the final read returns data with EOF.
+- Retain both source query aliases and existing playlist rewrite behavior.
+- Document configuration, a Compose example, API errors, and the replacement for
+  the previously documented but unused `M3U_TIMEOUT` setting.
+
+The integration extends the original patch with transport cleanup and body-read
+error handling identified during review. WARP is an optional external HTTP proxy;
+this change does not provision it or alter stream/engine VPN routing.
+
 ## Compatibility decisions
 
 Stream recovery remains opt-in. API-key configuration, the default runtime user,
@@ -106,6 +130,13 @@ the full Go suite and builds the unified Linux binary. Image smoke tests verifie
 probe imports, the liveness probe, healthcheck metadata, and nonzero supervisor
 exit when Docker is unavailable.
 
+M3U regression coverage uses local HTTP servers and a synthetic proxy to check
+configuration validation, explicit proxy routing, both query aliases, rewriting,
+upstream errors, truncated responses, header/body timeouts, cancellation, and
+final reads containing data plus EOF. The race-enabled Go suite passes with these
+tests. Docker build and image smoke results above are from the earlier recovery
+integration; they were not repeated for the M3U change.
+
 ## Remaining acceptance work
 
 Automated Docker behavior uses fake clients, while playback tests use local HTTP
@@ -116,3 +147,7 @@ require validation in an isolated environment.
 Recommended live checks include missed Docker events, stopped versus removed VPN
 containers, intermittent Docker failures, active viewers in both control modes,
 and threshold tuning for real bitrate and P2P gaps.
+
+M3U proxy tests do not exercise a live WARP service. Validate your deployed HTTP
+proxy listener, HTTPS destination tunneling, and playlist provider reachability
+in the target network.

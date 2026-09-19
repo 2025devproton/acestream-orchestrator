@@ -66,6 +66,13 @@ Typical replacements:
 - `acestream://<id>` -> `http://<host>:8000/ace/getstream?id=<id>`
 - `http://127.0.0.1:6878/ace/getstream?id=<id>` -> `http://<host>:8000/ace/getstream?id=<id>`
 
+Playlist downloads have a 30-second timeout. To fetch through an existing HTTP(S)
+proxy with WARP egress, set `M3U_FETCH_PROXY_URL` on the orchestrator container.
+Use `M3U_FETCH_TIMEOUT_S` to override the timeout (1–300 integer seconds).
+See [M3U download configuration](docs/CONFIG.md#m3u-downloads-through-an-http-proxy)
+for a Compose example and proxy behavior. This setting affects playlist downloads
+only; engine and stream routing is unchanged.
+
 ## Requirements
 
 - Docker and Docker Compose
