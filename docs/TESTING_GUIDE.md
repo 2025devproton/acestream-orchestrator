@@ -1,5 +1,28 @@
 # Testing Guide: Dynamic VPN Port Allocation
 
+## Recovery regression suite
+
+```bash
+cd app/orchestrator
+go test -race ./...
+cd ../..
+python3 -m unittest discover -s tests -v
+docker build -t acestream-orchestrator:recovery-review .
+```
+
+Tests use fake Docker responses, a disposable Redis test server, HTTP streaming
+servers, and a TCP engine-protocol stub. They do not need production containers
+or VPN credentials. Cases include cleanup ordering and retries, lease/port
+retention, static-node protection, missing nodes, unhealthy timestamp transitions,
+partial chunks, startup grace, cooldown, bounded restarts, slow HTTP negotiation,
+API session replacement/cancellation, probe policies, and supervisor exit codes.
+
+For live acceptance, use an isolated Docker environment and dedicated credentials.
+Stop and remove a dynamic VPN separately, repeat with missed events/reindexing,
+and verify resource release plus restored desired capacity. Exercise genuine
+P2P gaps and both playback modes with viewers attached. Do not infer live VPN
+recovery or media continuity from the stub-based tests alone.
+
 This guide validates dynamic VPN node provisioning and host-port distribution in orchestrator-managed mode.
 
 ## Preconditions

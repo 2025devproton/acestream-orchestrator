@@ -1,5 +1,43 @@
 # Health Monitoring & Usage Tracking
 
+## Container probes and recovery observability
+
+The image includes a Python standard-library probe and a liveness-only Docker
+healthcheck (30-second interval/start period, 5-second command timeout, 3 retries).
+Run the following inside the image, or use `python3 app/readiness.py` locally:
+
+```bash
+python3 /app/app/readiness.py --liveness
+python3 /app/app/readiness.py
+python3 /app/app/readiness.py --require-min-replicas
+python3 /app/app/readiness.py --provisioning
+```
+
+Liveness validates the `/api/v1/health/status` response, not engine capacity.
+Default readiness requires a healthy serving engine and, when enabled, a healthy
+VPN node. Healthy busy engines remain ready; a provisioning circuit breaker does
+not remove existing serving capacity. `--require-min-replicas` adds the configured
+minimum healthy-engine policy. Scale-to-zero is ready when the minimum is zero and
+the API permits lazy provisioning, including VPN provisioning. `--provisioning`
+reports the API's provisioning permission independently; it is not an actual
+provisioning attempt or a guarantee of available credentials/ports.
+
+All probes return 0 for success and 1 for failure, including startup/network and
+schema failures. Startup grace belongs to the supervisor, not a special exit code.
+Override the URL with `--url` or `ORCHESTRATOR_URL`, and request timeout with
+`--timeout` (default 3 seconds). The response body is limited to 1 MiB and is never
+included in failure output. Docker health status alone does not restart a
+container; the process supervisor exits nonzero when Redis or the Go binary dies,
+allowing the existing `restart: on-failure` policy to act. Intentional signals exit
+cleanly. The optional Proton sidecar retains its restart behavior.
+
+When stream recovery is enabled, logs distinguish session restart attempts from
+resumed buffer progress. Prometheus exposes
+`acestream_proxy_stream_recovery_total{outcome="attempted|resumed|failed|exhausted"}`
+and `acestream_proxy_stream_recovery_duration_seconds`. No content IDs are metric
+labels. Resumed progress means a completed buffer chunk, not verified playback.
+See [configuration](CONFIG.md#stream-stall-recovery-environment-only).
+
 The Acestream Orchestrator includes intelligent health monitoring and usage tracking capabilities to ensure optimal engine performance and enable smart proxy selection.
 
 ## Health Monitoring

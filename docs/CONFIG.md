@@ -4,6 +4,31 @@ The AceStream Orchestrator uses a UI-driven configuration system. All settings a
 
 ## Orchestrator Settings
 
+### Stream stall recovery (environment only)
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `STREAM_STALL_TIMEOUT_S` | `0` | Complete-buffer-chunk silence before session recovery; `0` disables recovery. |
+| `STREAM_STALL_CHECK_INTERVAL_S` | `5` | Progress sampling interval. |
+| `STREAM_STALL_COOLDOWN_S` | `30` | Minimum pause after negotiating a replacement session. |
+| `STREAM_STALL_MAX_RECOVERIES` | `3` | Maximum session restart attempts per stream manager lifetime. |
+
+Durations accept seconds or Go duration strings such as `25s`. Negative durations,
+and zero intervals/cooldowns, fall back to their defaults with a warning. The
+restart budget is clamped to at least one. These settings are not dashboard or
+SQLite settings. For example, set `STREAM_STALL_TIMEOUT_S=25` to opt in.
+
+Only streams with local viewers are recovered. Before the first full chunk,
+the timeout is at least `CHANNEL_INIT_GRACE_PERIOD_S`. Each recovery cancels the
+old reader, stops its playback session, and requests a new session on the same
+engine. A fresh reader generation gets its own progress timer. Exhausting the
+budget ends the stream with a timeout; it does not guarantee automatic engine
+or VPN failover. Choose thresholds for the expected bitrate and P2P gaps: a
+complete buffer chunk is a progress signal, not proof of decodable media.
+
+This applies to manager-based TS and API-mode HLS streams. The separate HTTP
+HLS manifest/segment proxy does not use this recovery mechanism.
+
 ### Engine Lifecycle
 - **Startup Timeout (s)**: Max time to wait for an engine to become ready. Default: 25s.
 - **Idle Engine TTL (s)**: How long an idle engine lives before being cleaned up. Default: 600s.

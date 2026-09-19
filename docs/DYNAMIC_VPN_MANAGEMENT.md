@@ -15,6 +15,33 @@ AceStream Orchestrator manages Gluetun VPN nodes dynamically using a declarative
 
 ## Credential Lease System
 
+### Recovery and container ownership
+
+VPN containers are excluded from engine discovery even when both share a managed
+label. Lifecycle ownership requires `acestream-orchestrator.managed=true` and
+`role=vpn_node`, plus `acestream.vpn.dynamic=true` for newly provisioned nodes.
+Legacy containers with those management labels and a `gluetun-dyn-` name remain
+supported. A name prefix or role alone never authorizes deletion. Static/external
+VPNs are not destroyed by recovery, startup cleanup, or shutdown cleanup; their
+drain/delete API requests return HTTP 409 while tracked as external.
+
+Stopped, exited, dead, and missing owned nodes retain recovery state through
+Docker event processing and reindexing. Missing nodes receive a 30-second startup
+grace. Cleanup uses exact names, verifies stored container IDs and ownership,
+removes dependent managed engine containers first, and only then removes the VPN.
+Docker errors retain the credential and AirVPN port for retry. Renamed containers
+or unexpected identity changes require operator reconciliation rather than forced
+deletion. Recovered capacity is recreated by the normal scaling loop.
+
+Healing uses `UnhealthySince`, independent of observation timestamps. Refreshing
+the same unhealthy container preserves its interval; verified recovery clears it,
+and a different container ID starts a new grace period. VPN state readers receive
+snapshots rather than writable pointers into shared state.
+
+At startup, leases are restored from both running and stopped owned containers
+before provisioning starts. An unavailable Docker snapshot fails startup instead
+of allocating credentials from an incomplete view.
+
 Credentials are not passive configuration entries. Each credential is a schedulable lease.
 
 ### Lifecycle
