@@ -128,3 +128,7 @@ Key environment variables:
 ```bash
 cd app/orchestrator && go test ./...
 ```
+
+For a ready-to-use Python, Go, React, Docker, Codex, RTK, and MCP environment,
+see [docs/DEVCONTAINER.md](docs/DEVCONTAINER.md) and reopen the repository in a
+VS Code Dev Container.

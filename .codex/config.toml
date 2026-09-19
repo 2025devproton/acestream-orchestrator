@@ -1,0 +1,8 @@
+# Project-scoped Codex configuration. Codex loads this file for trusted
+# repositories in both the CLI and the IDE extension.
+
+[mcp_servers.codebase-memory]
+command = "/usr/local/share/npm-global/bin/codebase-memory-mcp"
+args = []
+startup_timeout_sec = 10
+tool_timeout_sec = 60

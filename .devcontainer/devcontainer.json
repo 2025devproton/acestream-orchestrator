@@ -1,0 +1,89 @@
+{
+  "name": "AceStream Orchestrator",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "node",
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "os-provided",
+      "installTools": false
+    },
+    "ghcr.io/devcontainers/features/go:1": {
+      "version": "1.25"
+    },
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": true,
+      "installDockerBuildx": true,
+      "installDockerComposeSwitch": true,
+      "socketPath": "/var/run/docker-host.sock"
+    }
+  },
+  "mounts": [
+    {
+      "source": "/var/run/docker.sock",
+      "target": "/var/run/docker-host.sock",
+      "type": "bind"
+    },
+    {
+      "source": "acestream-orchestrator-codex",
+      "target": "/home/node/.codex",
+      "type": "volume"
+    },
+    {
+      "source": "acestream-orchestrator-codebase-memory",
+      "target": "/home/node/.cache/codebase-memory-mcp",
+      "type": "volume"
+    }
+  ],
+  "containerEnv": {
+    "DOCKER_BUILDKIT": "1",
+    "COMPOSE_DOCKER_CLI_BUILD": "1",
+    "LOCAL_WORKSPACE_FOLDER": "${localWorkspaceFolder}"
+  },
+  "forwardPorts": [8000, 8083, 5173, 9749],
+  "portsAttributes": {
+    "8000": {
+      "label": "AceStream panel / proxy",
+      "onAutoForward": "notify"
+    },
+    "8083": {
+      "label": "Orchestrator API",
+      "onAutoForward": "silent"
+    },
+    "5173": {
+      "label": "Vite development server",
+      "onAutoForward": "openBrowser"
+    },
+    "9749": {
+      "label": "Codebase Memory graph",
+      "onAutoForward": "openBrowser"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "openai.chatgpt",
+        "mhutchie.git-graph",
+        "golang.go",
+        "ms-python.python",
+        "ms-azuretools.vscode-docker",
+        "redhat.vscode-yaml"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+        "python.terminal.activateEnvironment": true,
+        "go.toolsManagement.autoUpdate": true,
+        "go.useLanguageServer": true,
+        "editor.formatOnSave": false
+      }
+    }
+  },
+  "runArgs": [
+    "--init"
+  ],
+  "postCreateCommand": "bash .devcontainer/post-create.sh"
+}
