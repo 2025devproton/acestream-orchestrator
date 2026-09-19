@@ -25,7 +25,8 @@ rather than a successful partial playlist. Redirects follow the standard Go
 HTTP client policy. The total download timeout defaults to 30 seconds.
 
 See [M3U configuration](CONFIG.md#m3u-downloads-through-an-http-proxy) for
-`M3U_FETCH_TIMEOUT_S` and `M3U_FETCH_PROXY_URL`, including WARP proxy usage.
+`M3U_FETCH_TIMEOUT_S`, `M3U_FETCH_PROXY_URL`, and optional `#EXTINF` name
+replacement settings, including WARP proxy usage.
 
 ## Provisioning
 ### POST /provision

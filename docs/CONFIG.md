@@ -135,6 +135,9 @@ All variables below can be set in your `docker-compose.yml` or passed via a `.en
 | `AUTO_DELETE` | `true` | Delete idle engines automatically when `IDLE_TTL_S` elapses. |
 | `M3U_FETCH_TIMEOUT_S` | `30` | Total M3U download timeout, including redirects and reading the body; integer seconds from `1` to `300`. Environment only. |
 | `M3U_FETCH_PROXY_URL` | *(none)* | HTTP(S) proxy used only for M3U downloads, e.g. `http://warp-proxy:3128`. Environment only. |
+| `M3U_FETCH_NAME_REGEX` | *(none)* | RE2 regular expression applied to the name part of `#EXTINF` lines. Environment only. |
+| `M3U_FETCH_NAME_REPLACEMENT` | *(none)* | Replacement used with `M3U_FETCH_NAME_REGEX`; empty removes matches. Supports Go/RE2 capture references such as `$1`. Environment only. |
+| `M3U_FETCH_NAME_REPLACEMENT_MODE` | `match` | `match` uses standard Go regex replacement semantics. `character` repeats the literal replacement once per character in each match. Environment only. |
 | `DEBUG_MODE` | `false` | **[UI]** Enable verbose debug logging. |
 | `MONITOR_INTERVAL_S` | `10` | Seconds between Docker container state polls. |
 
@@ -165,6 +168,27 @@ Upstream non-2xx responses, connection failures, timeouts, and body read failure
 return HTTP 502, without returning a partial playlist. Client cancellation also
 cancels the upstream request. The old documented `M3U_TIMEOUT` variable is not
 read by the Go endpoint; use `M3U_FETCH_TIMEOUT_S` instead.
+
+To normalize channel names, set `M3U_FETCH_NAME_REGEX` and optionally
+`M3U_FETCH_NAME_REPLACEMENT`. The regex is applied only to the name after the
+first comma in each `#EXTINF` line and uses standard Go replacement semantics
+by default. For example, to replace only trailing asterisks with `+` while
+preserving their count (so `*Channel ***` becomes `*Channel +++`), use
+character mode:
+
+```yaml
+services:
+  orchestrator:
+    environment:
+      M3U_FETCH_NAME_REGEX: '\*+$'
+      M3U_FETCH_NAME_REPLACEMENT: '+'
+      M3U_FETCH_NAME_REPLACEMENT_MODE: 'character'
+```
+
+Leave `M3U_FETCH_NAME_REPLACEMENT` empty to remove matches. An invalid regex, or
+a replacement configured without a regex, returns HTTP 500 when the endpoint
+is called. Character mode treats the replacement literally and does not support
+capture references.
 
 ### Engine Lifecycle
 

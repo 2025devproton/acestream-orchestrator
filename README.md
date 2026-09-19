@@ -69,6 +69,9 @@ Typical replacements:
 Playlist downloads have a 30-second timeout. To fetch through an existing HTTP(S)
 proxy with WARP egress, set `M3U_FETCH_PROXY_URL` on the orchestrator container.
 Use `M3U_FETCH_TIMEOUT_S` to override the timeout (1–300 integer seconds).
+Optionally use `M3U_FETCH_NAME_REGEX` with `M3U_FETCH_NAME_REPLACEMENT` to
+normalize names in `#EXTINF` lines. Use `M3U_FETCH_NAME_REPLACEMENT_MODE=character`
+when each character in a matched suffix should receive its own replacement.
 See [M3U download configuration](docs/CONFIG.md#m3u-downloads-through-an-http-proxy)
 for a Compose example and proxy behavior. This setting affects playlist downloads
 only; engine and stream routing is unchanged.

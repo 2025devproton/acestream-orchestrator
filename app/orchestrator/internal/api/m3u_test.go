@@ -88,6 +88,55 @@ func TestModifyM3UProxyAndRewrite(t *testing.T) {
 	}
 }
 
+func TestModifyM3UNameRewrite(t *testing.T) {
+	t.Setenv("M3U_FETCH_PROXY_URL", "")
+	t.Setenv("M3U_FETCH_TIMEOUT_S", "")
+	t.Setenv("M3U_FETCH_NAME_REGEX", `\*+$`)
+	t.Setenv("M3U_FETCH_NAME_REPLACEMENT", "+")
+	t.Setenv("M3U_FETCH_NAME_REPLACEMENT_MODE", "character")
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "#EXTM3U\n#EXTINF:-1 tvg-name=\"demo\",*Canal ***\nacestream://name-rewrite\n#EXTINF:-1,*Canal *\nace://single-star\n#EXTINF:-1,Sin sufijo\nace://unchanged\n")
+	}))
+	defer source.Close()
+
+	w := httptest.NewRecorder()
+	(&ProxyServer{}).mgHandleModifyM3U(w, m3uRequest(source.URL, "m3u_url"))
+	want := "#EXTM3U\n#EXTINF:-1 tvg-name=\"demo\",*Canal +++\nhttp://player:8000/ace/getstream?id=name-rewrite\n#EXTINF:-1,*Canal +\nhttp://player:8000/ace/getstream?id=single-star\n#EXTINF:-1,Sin sufijo\nhttp://player:8000/ace/getstream?id=unchanged\n"
+	if w.Code != http.StatusOK || w.Body.String() != want {
+		t.Fatalf("response = %d %s", w.Code, w.Body)
+	}
+}
+
+func TestM3UFetchNameRewriterConfiguration(t *testing.T) {
+	t.Run("standard regex replacement", func(t *testing.T) {
+		t.Setenv("M3U_FETCH_NAME_REGEX", `(demo)`)
+		t.Setenv("M3U_FETCH_NAME_REPLACEMENT", `[$1]`)
+		t.Setenv("M3U_FETCH_NAME_REPLACEMENT_MODE", "")
+		re, replacement, perCharacter, err := m3uFetchNameRewriter()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perCharacter || rewriteM3UName("demo demo", re, replacement, perCharacter) != "[demo] [demo]" {
+			t.Fatal("standard regex replacement was not applied")
+		}
+	})
+
+	t.Run("invalid regex", func(t *testing.T) {
+		t.Setenv("M3U_FETCH_NAME_REGEX", "[")
+		t.Setenv("M3U_FETCH_NAME_REPLACEMENT", "")
+		if _, _, _, err := m3uFetchNameRewriter(); err == nil {
+			t.Fatal("expected invalid regex error")
+		}
+	})
+	t.Run("replacement requires regex", func(t *testing.T) {
+		t.Setenv("M3U_FETCH_NAME_REGEX", "")
+		t.Setenv("M3U_FETCH_NAME_REPLACEMENT", "+")
+		if _, _, _, err := m3uFetchNameRewriter(); err == nil {
+			t.Fatal("expected configuration error")
+		}
+	})
+}
+
 func TestModifyM3UFetchFailures(t *testing.T) {
 	for _, mode := range []string{"status", "truncated", "timeout headers", "timeout body", "canceled", "invalid config", "success"} {
 		t.Run(mode, func(t *testing.T) {

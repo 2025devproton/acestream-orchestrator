@@ -12,9 +12,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -1519,6 +1521,61 @@ func (s *ProxyServer) mgHandleCacheClear(w http.ResponseWriter, r *http.Request)
 
 const defaultM3UFetchTimeout = 30 * time.Second
 
+func m3uFetchNameRewriter() (*regexp.Regexp, string, bool, error) {
+	pattern := os.Getenv("M3U_FETCH_NAME_REGEX")
+	replacement := os.Getenv("M3U_FETCH_NAME_REPLACEMENT")
+	if pattern == "" {
+		if replacement != "" {
+			return nil, "", false, fmt.Errorf("M3U_FETCH_NAME_REPLACEMENT requires M3U_FETCH_NAME_REGEX")
+		}
+		return nil, "", false, nil
+	}
+
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("M3U_FETCH_NAME_REGEX is invalid: %w", err)
+	}
+
+	mode := strings.TrimSpace(os.Getenv("M3U_FETCH_NAME_REPLACEMENT_MODE"))
+	switch mode {
+	case "", "match":
+		return re, replacement, false, nil
+	case "character":
+		if strings.Contains(replacement, "$") {
+			return nil, "", false, fmt.Errorf("M3U_FETCH_NAME_REPLACEMENT cannot contain capture references in character mode")
+		}
+		return re, replacement, true, nil
+	default:
+		return nil, "", false, fmt.Errorf("M3U_FETCH_NAME_REPLACEMENT_MODE must be match or character")
+	}
+}
+
+func rewriteM3UName(name string, re *regexp.Regexp, replacement string, perCharacter bool) string {
+	if !perCharacter {
+		return re.ReplaceAllString(name, replacement)
+	}
+
+	matches := re.FindAllStringIndex(name, -1)
+	if len(matches) == 0 {
+		return name
+	}
+
+	var rewritten strings.Builder
+	last := 0
+	for _, match := range matches {
+		rewritten.WriteString(name[last:match[0]])
+		matched := name[match[0]:match[1]]
+		if matched == "" {
+			rewritten.WriteString(re.ReplaceAllString(matched, replacement))
+		} else {
+			rewritten.WriteString(strings.Repeat(replacement, utf8.RuneCountInString(matched)))
+		}
+		last = match[1]
+	}
+	rewritten.WriteString(name[last:])
+	return rewritten.String()
+}
+
 func m3uFetchClient() (*http.Client, error) {
 	timeout := defaultM3UFetchTimeout
 	if raw := strings.TrimSpace(os.Getenv("M3U_FETCH_TIMEOUT_S")); raw != "" {
@@ -1573,6 +1630,11 @@ func (s *ProxyServer) mgHandleModifyM3U(w http.ResponseWriter, r *http.Request) 
 	if host == "" {
 		host = "localhost:8000"
 	}
+	nameRewriter, nameReplacement, namePerCharacter, err := m3uFetchNameRewriter()
+	if err != nil {
+		mgWriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
@@ -1606,6 +1668,11 @@ func (s *ProxyServer) mgHandleModifyM3U(w http.ResponseWriter, r *http.Request) 
 	scanner := newLineScanner(resp.Body)
 	for scanner.Scan() {
 		line = scanner.Text()
+		if nameRewriter != nil && strings.HasPrefix(line, "#EXTINF:") {
+			if comma := strings.IndexByte(line, ','); comma >= 0 {
+				line = line[:comma+1] + rewriteM3UName(line[comma+1:], nameRewriter, nameReplacement, namePerCharacter)
+			}
+		}
 		if strings.HasPrefix(line, "acestream://") {
 			contentID := strings.TrimPrefix(line, "acestream://")
 			line = baseURL + "/ace/getstream?id=" + contentID
